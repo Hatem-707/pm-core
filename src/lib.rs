@@ -1,4 +1,6 @@
 use std::{
+    backtrace,
+    cmp::Ordering,
     fs::{self, File},
     io::{BufReader, Read},
     path::{Path, PathBuf},
@@ -23,7 +25,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 static SECURE_PARAMS: Result<argon2::Params, argon2::Error> =
     argon2::Params::new(262_144, 4, 1, None); // 256 MB main encryption
 
-static LOG_MAX_LEN: usize = 1023;
+static LOG_MAX_LEN: usize = 1024;
 static PRE_ALLOC_SECURE_BUF: bool = true;
 
 fn clear_dir(dir_path: &Path) -> Result<()> {
@@ -200,8 +202,7 @@ impl MetaData {
 #[derive(Debug, Serialize, Deserialize, ZeroizeOnDrop)]
 struct SecureRingBuf<T: Zeroize> {
     max_cap: usize,
-    beg: usize,
-    end: usize,
+    write_index: usize,
     buf: Vec<T>,
 }
 
@@ -209,159 +210,72 @@ impl<T: Zeroize> SecureRingBuf<T> {
     pub fn new(mut max_cap: usize) -> Self {
         max_cap = std::cmp::max(max_cap, 15);
         let buf = if PRE_ALLOC_SECURE_BUF {
-            Vec::<T>::with_capacity(max_cap + 1) // aditional element to handle extra push
+            Vec::<T>::with_capacity(max_cap) // aditional element to handle extra push
         } else {
             vec![] // for maximum secuiry the vector should reserve memory
         };
 
         Self {
             max_cap,
-            beg: 0,
-            end: 0,
+            write_index: 0,
             buf,
         }
     }
 
     pub fn push(&mut self, value: T) {
-        self.buf.push(value); // might cause a secret leak due to rellocation
-        self.end = (self.end + 1) % self.max_cap;
-        if self.buf.len() > self.max_cap {
-            // will only get triggered at len == max_cap + 1
-            if self.beg == self.end {
-                self.beg = (self.beg + 1) % self.max_cap; // to prevent it from running each update might need tunning
-            }
-            self.buf.swap_remove(self.end); // add value to the correct position and drops an old value
+        if self.buf.len() >= self.max_cap {
+            self.buf[self.write_index] = value;
+        } else {
+            self.buf.push(value);
         }
+        self.write_index = (self.write_index + 1) % self.max_cap;
     }
 
     pub fn iter(&'_ self) -> SecureRingBufIterator<'_, T> {
+        let index = if self.buf.len() >= self.max_cap {
+            (self.write_index + 1) % self.max_cap
+        } else {
+            0
+        };
         SecureRingBufIterator {
             ref_buf: &self,
-            index: self.beg,
+            index,
+            count: 0,
         }
     }
 
     pub fn merge<F>(&mut self, other: &mut SecureRingBuf<T>, cmp: F)
     // fills the buf whith the largest max_cap items w.r.t cmp
     where
-        F: Fn(&T, &T) -> bool,
+        F: Fn(&T, &T) -> Ordering,
     {
-        let index_map = |i: usize, size: usize| (i + self.beg) % size;
-        // we can use a custom co_rank function and linear merge since the buffer is assumed sorted
-        let co_rank = |rank: usize| -> (usize, usize) {
-            let mut l = if rank > other.buf.len() {
-                // ensure j - 1 is valid
-                rank - other.buf.len()
-            } else {
-                0
-            };
-            let mut r = std::cmp::min(rank, self.max_cap);
-
-            while l < r {
-                let j = rank - l;
-                if cmp(
-                    &self.buf[index_map(l, self.buf.len())],
-                    &other.buf[index_map(j - 1, self.buf.len())],
-                ) {
-                    l += (l + r) / 2;
-                } else {
-                    r -= (l + r) / 2;
-                }
-            }
-
-            (
-                index_map(l, self.buf.len()),
-                index_map(rank - l, other.buf.len()),
-            )
-        };
-
-        let total_size = self.buf.len() + other.buf.len();
-
-        let (beg_a, beg_b) = co_rank(std::cmp::max(0, total_size - self.max_cap));
-        let (end_a, end_b) = co_rank(std::cmp::min(self.max_cap, total_size));
-
-        let mut merged_history = Vec::<T>::with_capacity(self.max_cap);
-
-        let mut _merge = |mut _a: &mut Drain<'_, T>, mut _b: &mut Drain<'_, T>| -> () {
-            let mut curr_a = _a.next();
-            let mut curr_b = _b.next();
-
-            loop {
-                match (curr_a, curr_b) {
-                    (Some(ele_a), Some(ele_b)) => {
-                        if cmp(&ele_a, &ele_b) {
-                            merged_history.push(ele_a);
-                            curr_a = _a.next();
-                            curr_b = Some(ele_b);
-                        } else {
-                            merged_history.push(ele_b);
-                            curr_a = Some(ele_a);
-                            curr_b = _b.next();
-                        }
-                    }
-                    (Some(ele), None) => {
-                        merged_history.push(ele);
-                        merged_history.extend(&mut _a);
-                        break;
-                    }
-                    (None, Some(ele)) => {
-                        merged_history.push(ele);
-                        merged_history.extend(&mut _b);
-                        break;
-                    }
-                    _ => break,
-                }
-            }
-        };
-
-        match (beg_a < end_a, beg_b < end_b) {
-            (true, true) => {
-                let mut _a = self.buf.drain(beg_a..end_a);
-                let mut _b = other.buf.drain(beg_b..end_b);
-                _merge(&mut _a, &mut _b);
-            }
-            (true, false) => {
-                let mut _a = self.buf.drain(beg_a..end_a);
-                let mut _b = other.buf.drain(beg_b..);
-                _merge(&mut _a, &mut _b);
-                drop(_b);
-                let mut _b = other.buf.drain(0..end_b);
-                _merge(&mut _a, &mut _b);
-            }
-            (false, true) => {
-                let mut _a = self.buf.drain(beg_a..);
-                let mut _b = other.buf.drain(beg_b..end_b);
-                _merge(&mut _a, &mut _b);
-                drop(_a);
-                let mut _a = self.buf.drain(0..end_a);
-                _merge(&mut _a, &mut _b);
-            }
-            _ => {
-                let mut _a = self.buf.drain(beg_a..);
-                let mut _b = other.buf.drain(beg_b..);
-                _merge(&mut _a, &mut _b);
-                drop(_a);
-                drop(_b);
-                let mut _a = self.buf.drain(0..end_a);
-                let mut _b = other.buf.drain(0..end_b);
-                _merge(&mut _a, &mut _b);
-            }
-        }
+        let mut merged = Vec::<T>::with_capacity(self.buf.len() + other.buf.len());
+        let mut a = self.buf.drain(..);
+        let mut b = other.buf.drain(..);
+        merged.extend(&mut a);
+        merged.extend(&mut b);
+        merged.sort_by(cmp);
+        drop(a);
+        drop(b);
+        let start = std::cmp::max(0, merged.len() - self.max_cap);
+        self.buf.extend(merged.drain(start..));
     }
 }
 
 struct SecureRingBufIterator<'a, T: Zeroize> {
     ref_buf: &'a SecureRingBuf<T>,
     index: usize,
+    count: usize,
 }
 
 impl<'a, T: Zeroize> Iterator for SecureRingBufIterator<'a, T> {
     type Item = &'a T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.index != self.ref_buf.end {
+        if self.count < self.ref_buf.max_cap {
             let result = &self.ref_buf.buf[self.index];
             self.index = (self.index + 1) % self.ref_buf.buf.len();
+            self.count += 1;
             Some(result)
         } else {
             None
@@ -514,8 +428,9 @@ impl Payload {
     }
 
     pub fn merge(&mut self, mut other: Payload) {
-        self.log_history
-            .merge(&mut other.log_history, |a, b| a.time_stamp < b.time_stamp);
+        self.log_history.merge(&mut other.log_history, |a, b| {
+            a.time_stamp.cmp(&b.time_stamp)
+        });
 
         // since we are using v7 uuids we can use sorted vector set union algorithm
 
