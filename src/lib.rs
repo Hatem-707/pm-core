@@ -636,26 +636,6 @@ where
     state: V,
 }
 
-impl<V> Vault<V>
-where
-    V: ZeroizeOnDrop + VaultMarker,
-{
-    pub fn empty(
-        repo_name: &str,
-        device_name: Option<&str>,
-        device_type: Option<&str>,
-        path: &Path,
-    ) -> Vault<LockedVault> {
-        Vault {
-            repo_name: repo_name.to_string(),
-            device_name: device_name.as_deref().map(|s| s.to_string()),
-            device_type: device_type.as_deref().map(|s| s.to_string()),
-            cache_path: path.to_path_buf(),
-            state: LockedVault,
-        }
-    }
-}
-
 impl Vault<UnlockedVault> {
     pub fn add_entry(
         &mut self,
@@ -829,6 +809,21 @@ impl Vault<UnlockedVault> {
 }
 
 impl Vault<LockedVault> {
+    pub fn empty(
+        repo_name: &str,
+        device_name: Option<&str>,
+        device_type: Option<&str>,
+        path: &Path,
+    ) -> Vault<LockedVault> {
+        Vault {
+            repo_name: repo_name.to_string(),
+            device_name: device_name.as_deref().map(|s| s.to_string()),
+            device_type: device_type.as_deref().map(|s| s.to_string()),
+            cache_path: path.to_path_buf(),
+            state: LockedVault,
+        }
+    }
+
     pub async fn remote_unlock(self, master_key: &str) -> Result<Vault<UnlockedVault>> {
         let session_key = SessionKey::new(master_key)?;
         let client = reqwest::Client::builder().build()?;
@@ -932,7 +927,7 @@ impl Vault<LockedVault> {
 
         let local_blob = Blob {
             salt: salt,
-            nonce: remote_params.nonce,
+            nonce: local_params.nonce,
             payload_store: encrypted_payload,
         };
 

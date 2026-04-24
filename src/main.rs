@@ -4,11 +4,11 @@ use std::{
 };
 
 use anyhow::Result;
-use pm_core::VaultEnum;
+use pm_core::{UnlockedVault, Vault, LockedVault};
 use ssh_key::{PrivateKey, rand_core::OsRng};
 use uuid::Uuid;
 
-fn action(vault: &mut VaultEnum) -> Result<()> {
+fn action(vault: &mut Vault<UnlockedVault>) -> Result<()> {
     loop {
         println!("Choose an operation: (Add | Get | View | Logs | Quit)");
         let mut user_state = String::new();
@@ -68,27 +68,27 @@ async fn main() -> Result<()> {
         );
         println!("Enter a new master password: (should be very strong)");
         stdin().read_line(&mut master_key)?;
-        let mut vault = VaultEnum::empty(
+        let vault = Vault::empty(
             repo_name.trim(),
             Some("hatem laptop"),
             Some("Linux laptop"),
             &cache_path,
-            master_key.trim().to_string(),
+        );
+        vault.init_repo(
             &priv_key.to_openssh(ssh_key::LineEnding::LF)?,
+            &master_key
         )?;
-        vault.init_repo()?;
     } else if user_state.trim() == "Fetch" {
         println!("Enter the master password: (must be the same one the repo uses)");
         let mut master_key = String::new();
         stdin().read_line(&mut master_key)?;
-        let mut vault = VaultEnum::from_remote(
+        let vault = Vault::empty(
             repo_name.trim(),
             Some("hatem laptop"),
             Some("Linux laptop"),
             &cache_path,
-            master_key.trim().to_string(),
-        )
-        .await?;
+        );
+        let mut vault = vault.remote_unlock(&master_key).await?;
         vault.local_sync()?;
         action(&mut vault)?;
         vault.remote_sync()?;
@@ -96,14 +96,15 @@ async fn main() -> Result<()> {
         println!("Enter the master password: (must be the same one the repo uses)");
         let mut master_key = String::new();
         stdin().read_line(&mut master_key)?;
-        let mut vault = VaultEnum::from_local(
+        let vault = Vault::empty(
+            repo_name.trim(),
             Some("hatem laptop"),
             Some("Linux laptop"),
             &cache_path,
-            master_key.trim().to_string(),
-        )?;
+        );
+        let mut vault = vault.local_unlock(&master_key)?;
         action(&mut vault)?;
-        vault.update_local_cache()?;
+        vault.local_sync()?;
     } else {
         stderr().write(b"Invalid Option")?;
     }
