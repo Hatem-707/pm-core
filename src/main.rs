@@ -76,7 +76,7 @@ async fn main() -> Result<()> {
         );
         vault.init_repo(
             &priv_key.to_openssh(ssh_key::LineEnding::LF)?,
-            &master_key
+            master_key.trim()
         )?;
     } else if user_state.trim() == "Fetch" {
         println!("Enter the master password: (must be the same one the repo uses)");
@@ -88,10 +88,10 @@ async fn main() -> Result<()> {
             Some("Linux laptop"),
             &cache_path,
         );
-        let mut vault = vault.remote_unlock(&master_key).await?;
+        let mut vault = vault.remote_unlock_cached(master_key.trim()).await?;
         vault.local_sync()?;
         action(&mut vault)?;
-        vault.remote_sync()?;
+        vault.global_sync()?;
     } else if user_state.trim() == "Read" {
         println!("Enter the master password: (must be the same one the repo uses)");
         let mut master_key = String::new();
@@ -102,7 +102,7 @@ async fn main() -> Result<()> {
             Some("Linux laptop"),
             &cache_path,
         );
-        let mut vault = vault.local_unlock(&master_key)?;
+        let mut vault = vault.local_unlock_cached(master_key.trim())?;
         action(&mut vault)?;
         vault.local_sync()?;
     } else {

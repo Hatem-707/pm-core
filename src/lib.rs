@@ -1,21 +1,23 @@
 #![allow(private_bounds)]
 use std::{
     cmp::Ordering,
+    collections::HashMap,
     fs::{self, File},
     io::{BufReader, Read},
     path::{Path, PathBuf},
-    str::from_utf8,
     vec::Drain,
 };
 
 use anyhow::{Error, Result};
 use argon2;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, aead::Aead};
 use educe::Educe;
 use git2::{
     Commit, Cred, FetchOptions, ObjectType, Oid, PushOptions, RemoteCallbacks, Repository,
     Signature,
 };
+use keyring::Entry;
 use postcard::{from_bytes, to_stdvec};
 use rand::{TryRng, prelude::*, rngs::SysRng};
 use serde::{Deserialize, Serialize};
@@ -26,10 +28,89 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 static SECURE_PARAMS: Result<argon2::Params, argon2::Error> =
     argon2::Params::new(262_144, 4, 4, None); // 256 MB main encryption
 
-static FAST_PARAMS: Result<argon2::Params, argon2::Error> = argon2::Params::new(65536, 3, 4, None); // 64 MB local encryption 5 times faster
+static FAST_PARAMS: Result<argon2::Params, argon2::Error> = argon2::Params::new(32_768, 3, 4, None); // stores the encrypted key in os storage
 
 static LOG_MAX_LEN: usize = 1024;
 static PRE_ALLOC_SECURE_BUF: bool = true;
+
+#[derive(Deserialize, Serialize, ZeroizeOnDrop)]
+struct KeyStore {
+    cipher_text: Vec<u8>,
+    salt: [u8; 16],
+    nonce: [u8; 24],
+}
+
+fn derive_key(password: &[u8], salt: [u8; 16]) -> Result<[u8; 32]> {
+    let argon2 = argon2::Argon2::new(
+        argon2::Algorithm::Argon2id,
+        argon2::Version::V0x13,
+        SECURE_PARAMS.clone().unwrap(),
+    );
+    let mut key = [0; 32];
+    argon2
+        .hash_password_into(password, &salt, key.as_mut_slice())
+        .map_err(|_| Error::msg("Couldn't generate hashing parameters"))?;
+    Ok(key)
+}
+
+fn cache_key(key: [u8; 32], password: &[u8]) -> Result<()> {
+    let mut salt = [0u8; 16];
+    let mut nonce = [0u8; 24];
+    let mut rng = SysRng;
+    rng.try_fill_bytes(&mut salt)?;
+    rng.try_fill_bytes(&mut nonce)?;
+
+    let argon2 = argon2::Argon2::new(
+        argon2::Algorithm::Argon2id,
+        argon2::Version::V0x13,
+        FAST_PARAMS.clone().unwrap(),
+    );
+    let mut output = [0; 32];
+    argon2
+        .hash_password_into(password, &salt, &mut output)
+        .map_err(|_| Error::msg("Couldn't generate hashing parameters"))?;
+
+    let cipher = XChaCha20Poly1305::new(&output.into());
+
+    let hashed_key = cipher.encrypt(&nonce.into(), key.as_slice())?;
+
+    let store = KeyStore {
+        cipher_text: hashed_key,
+        salt,
+        nonce,
+    };
+
+    let entry = Entry::new("SecretInnKeep", "TauriUserKey")?;
+    entry.set_password(&STANDARD.encode(to_stdvec(&store)?.as_slice()))?;
+    Ok(())
+}
+
+fn retrive_key(password: &[u8]) -> Result<[u8; 32]> {
+    let entry = Entry::new("SecretInnKeep", "TauriUserKey")?;
+    let secret = entry.get_password()?;
+
+    let store = from_bytes::<KeyStore>(STANDARD.decode(&secret)?.as_slice())?;
+
+    let argon2 = argon2::Argon2::new(
+        argon2::Algorithm::Argon2id,
+        argon2::Version::V0x13,
+        FAST_PARAMS.clone().unwrap(),
+    );
+
+    let mut output = [0; 32];
+    argon2
+        .hash_password_into(password, &store.salt, &mut output)
+        .map_err(|_| Error::msg("Couldn't generate hashing parameters"))?;
+
+    let cipher = XChaCha20Poly1305::new(&output.into());
+
+    let key: [u8; 32] = cipher
+        .decrypt(&store.nonce.into(), store.cipher_text.as_slice())?
+        .as_slice()
+        .try_into()?;
+
+    Ok(key)
+}
 
 fn clone_snapshot(path: &Path, repo_name: &str, priv_key: &str) -> Result<Repository> {
     clone_archive(path, repo_name, 1, priv_key)
@@ -167,80 +248,6 @@ struct HashParam {
     nonce: [u8; 24],
 }
 
-impl HashParam {
-    pub fn new(password: &[u8], salt: [u8; 16], argon_params: argon2::Params) -> Result<Self> {
-        let argon2 = argon2::Argon2::new(
-            argon2::Algorithm::Argon2id,
-            argon2::Version::V0x13,
-            argon_params,
-        );
-
-        let mut nonce = [0u8; 24];
-        let mut rng = SysRng;
-        rng.try_fill_bytes(&mut nonce)?;
-
-        let mut key = [0; 32];
-        argon2
-            .hash_password_into(password, &salt, key.as_mut_slice())
-            .map_err(|_| Error::msg("Couldn't generate hashing parameters"))?;
-
-        Ok(Self { key, nonce })
-    }
-
-    pub fn with_nonce(
-        password: &[u8],
-        salt: [u8; 16],
-        nonce: [u8; 24],
-        argon_params: argon2::Params,
-    ) -> Result<Self> {
-        let argon2 = argon2::Argon2::new(
-            argon2::Algorithm::Argon2id,
-            argon2::Version::V0x13,
-            argon_params,
-        );
-
-        let mut key = [0; 32];
-        argon2
-            .hash_password_into(password, &salt, key.as_mut_slice())
-            .map_err(|_| Error::msg("Couldn't generate hashing parameters"))?;
-
-        Ok(Self { key, nonce })
-    }
-}
-
-#[derive(ZeroizeOnDrop, Serialize, Deserialize)]
-struct SessionKey {
-    hashed_key: Vec<u8>,
-    kek: [u8; 32], // key encryption key
-    ken: [u8; 24], // key encryption nonce
-}
-
-impl SessionKey {
-    pub fn new(key: &str) -> Result<Self> {
-        let mut rng = SysRng;
-        let mut kek = [0u8; 32];
-        let mut ken = [0u8; 24];
-        rng.try_fill_bytes(&mut kek)?;
-        rng.try_fill_bytes(&mut ken)?;
-
-        let cipher = XChaCha20Poly1305::new(&kek.into());
-        let hashed_key = cipher.encrypt(&ken.into(), key.as_bytes())?;
-
-        Ok(Self {
-            hashed_key,
-            kek,
-            ken,
-        })
-    }
-
-    pub fn get_key(&self) -> Result<Zeroizing<Vec<u8>>> {
-        let mut plain_key = Zeroizing::new(Vec::<u8>::with_capacity(self.hashed_key.len()));
-        let cipher = XChaCha20Poly1305::new(&self.kek.into());
-        plain_key.extend(cipher.decrypt(&self.ken.into(), self.hashed_key.as_slice())?);
-        Ok(plain_key)
-    }
-}
-
 #[derive(Debug, Serialize, Deserialize, ZeroizeOnDrop, Zeroize)]
 pub struct MetaData {
     pub repo_name: String,
@@ -324,43 +331,13 @@ impl<T: Zeroize> SecureRingBuf<T> {
     where
         F: Fn(&T, &T) -> Ordering,
     {
-        let mut merged;
-        match (
-            self.buf.len() < self.max_cap,
-            other.buf.len() < other.max_cap,
-        ) {
-            (true, true) => {
-                let mut a = self.buf.drain(..);
-                let mut b = other.buf.drain(..);
-                merged = set_union(&mut a, &mut b, cmp);
-            }
-            (true, false) => {
-                let mut a = self.buf.drain(..);
-                let mut b = other.buf.drain(other.write_index..);
-                merged = set_union(&mut a, &mut b, &cmp);
-                drop(b);
-                let mut b = other.buf.drain(..other.write_index);
-                merged.extend(set_union(&mut a, &mut b, &cmp));
-            }
-            (false, true) => {
-                let mut a = self.buf.drain(self.write_index..);
-                let mut b = other.buf.drain(..);
-                merged = set_union(&mut a, &mut b, &cmp);
-                drop(a);
-                let mut a = self.buf.drain(..self.write_index);
-                merged.extend(set_union(&mut a, &mut b, &cmp));
-            }
-            (false, false) => {
-                let mut a = self.buf.drain(self.write_index..);
-                let mut b = other.buf.drain(other.write_index..);
-                merged = set_union(&mut a, &mut b, &cmp);
-                drop(a);
-                drop(b);
-                let mut a = self.buf.drain(..self.write_index);
-                let mut b = other.buf.drain(..other.write_index);
-                merged.extend(set_union(&mut a, &mut b, &cmp));
-            }
-        };
+        let mut a: Vec<T> = self.buf.drain(..).collect();
+        a.sort_by(&cmp);
+
+        let mut b: Vec<T> = other.buf.drain(..).collect();
+        b.sort_by(&cmp);
+
+        let mut merged = set_union(&mut a.drain(..), &mut b.drain(..), &cmp);
 
         let start = std::cmp::max(0, merged.len() as isize - self.max_cap as isize) as usize;
         self.buf.extend(merged.drain(start..));
@@ -480,8 +457,7 @@ impl<'a> PasswordView<'a> {
 #[derive(ZeroizeOnDrop, Serialize, Deserialize, Educe)]
 #[educe(Debug)]
 struct Payload {
-    #[educe(Debug(ignore))]
-    priv_key: SessionKey,
+    priv_key: String,
     log_history: SecureRingBuf<MetaData>,
     passwords: Vec<PasswordEntry>,
     #[serde(skip_deserializing)]
@@ -492,8 +468,7 @@ struct Payload {
 impl Payload {
     fn size(&self) -> usize {
         // not counting the padding
-        self.priv_key.hashed_key.len()
-            + 56
+        self.priv_key.len()
             + self.passwords.len() * size_of::<PasswordEntry>()
             + self
                 .passwords
@@ -527,7 +502,7 @@ impl Payload {
 
     pub fn new(priv_key: &str) -> Result<Self> {
         Ok(Self {
-            priv_key: SessionKey::new(priv_key)?,
+            priv_key: priv_key.to_string(),
             log_history: SecureRingBuf::new(LOG_MAX_LEN),
             passwords: vec![],
             padding: vec![],
@@ -550,23 +525,21 @@ impl Payload {
 
         // since we are using v7 uuids we can use sorted vector set union algorithm
 
-        let mut a = self.passwords.drain(..);
-        let mut b = other.passwords.drain(..);
+        let mut merged: HashMap<Uuid, PasswordEntry> =
+            self.passwords.drain(..).map(|p| (p.uuid, p)).collect();
 
-        let merged_passwords = set_union(&mut a, &mut b, |a, b| {
-            match (a.uuid.cmp(&b.uuid), a.last_edit.cmp(&b.last_edit)) {
-                (Ordering::Less, _) => Ordering::Less,
-                (Ordering::Greater, _) => Ordering::Greater,
-                (Ordering::Equal, Ordering::Less) => Ordering::Greater,
-                (Ordering::Equal, Ordering::Equal) => Ordering::Equal,
-                (Ordering::Equal, Ordering::Greater) => Ordering::Less,
+        for pwd in other.passwords.drain(..){
+            let edit_time = pwd.last_edit;
+            match merged.insert(pwd.uuid, pwd){
+                Some(cur) => {
+                    if edit_time < cur.last_edit {
+                        merged.insert(cur.uuid, cur);
+                    } 
+                }
+                None => {}
             }
-        });
-
-        drop(a);
-        drop(b);
-
-        self.passwords.extend(merged_passwords);
+        }
+        
     }
 }
 
@@ -586,7 +559,7 @@ impl Blob {
         from_bytes::<Blob>(&bytes).map_err(|_| Error::msg("Error reading Blob from file"))
     }
 
-    pub fn decrypt(self, params: &HashParam) -> Result<Payload> {
+    pub fn decrypt(&self, params: &HashParam) -> Result<Payload> {
         let cipher = XChaCha20Poly1305::new(&params.key.into());
         let payload_bytes =
             Zeroizing::new(cipher.decrypt(&params.nonce.into(), self.payload_store.as_slice())?);
@@ -605,17 +578,13 @@ impl VaultMarker for LockedVault {}
 
 #[derive(ZeroizeOnDrop)]
 pub struct UnlockedVault {
-    session_key: SessionKey,
+    session_key: [u8; 32],
     payload: Payload,
 }
 
 impl VaultMarker for UnlockedVault {}
 
 impl UnlockedVault {
-    fn get_session_key(&self) -> &SessionKey {
-        &self.session_key
-    }
-
     fn get_payload_mut(&mut self) -> &mut Payload {
         &mut self.payload
     }
@@ -730,7 +699,7 @@ impl Vault<UnlockedVault> {
         }
     }
 
-    fn sync(&mut self, file_path: &Path, params: argon2::Params) -> Result<()> {
+    fn sync(&mut self, file_path: &Path) -> Result<()> {
         if !file_path.is_file() {
             return Err(Error::msg(format!(
                 "Vault file doesn't exist {:?}",
@@ -740,12 +709,11 @@ impl Vault<UnlockedVault> {
 
         let blob = Blob::from_file(file_path)?;
 
-        let file_params = HashParam::with_nonce(
-            &self.state.get_session_key().get_key()?,
-            blob.salt,
-            blob.nonce,
-            params.clone(),
-        )?;
+        let file_params = HashParam {
+            key: self.state.session_key,
+            nonce: blob.nonce,
+        };
+
         let payload = blob.decrypt(&file_params)?;
 
         self.state.get_payload_mut().merge(payload);
@@ -755,23 +723,25 @@ impl Vault<UnlockedVault> {
             self.device_type.as_deref(),
         );
 
-        let mut salt = [0u8; 16];
+        let mut nonce = [0u8; 24];
         let mut rng = SysRng;
-        rng.try_fill_bytes(&mut salt)?;
+        rng.try_fill_bytes(&mut nonce)?;
 
-        let updated_params =
-            HashParam::new(&self.state.get_session_key().get_key()?, salt, params)?;
+        let updated_params = HashParam {
+            key: self.state.session_key,
+            nonce: nonce,
+        };
 
         self.state.get_payload_mut().pad();
         let encrypted_payload = self.state.get_payload().encrypt(&updated_params)?;
 
-        let blob = Blob {
-            salt: salt,
+        let updated_blob = Blob {
+            salt: blob.salt,
             nonce: updated_params.nonce,
             payload_store: encrypted_payload,
         };
 
-        let serialized_blob = to_stdvec(&blob)?;
+        let serialized_blob = to_stdvec(&updated_blob)?;
 
         fs::write(file_path, serialized_blob.as_slice())?;
         Ok(())
@@ -783,27 +753,24 @@ impl Vault<UnlockedVault> {
         let repo = clone_snapshot(
             &(self.cache_path.join(repo_offset)),
             &self.repo_name,
-            from_utf8(&self.state.get_payload().priv_key.get_key()?)?,
+            &self.state.get_payload().priv_key,
         )?;
 
-        self.sync(
-            &(self.cache_path.join(repo_offset).join("vault.dat")),
-            SECURE_PARAMS.clone().unwrap(),
-        )?;
+        self.sync(&(self.cache_path.join(repo_offset).join("vault.dat")))?;
 
         add_and_commit(&repo, Path::new("vault.dat"), "Commit Message")?;
-        ssh_push(
-            &repo,
-            from_utf8(&self.state.get_payload().priv_key.get_key()?)?,
-        )?;
+        ssh_push(&repo, &self.state.get_payload().priv_key)?;
         Ok(())
     }
 
     pub fn local_sync(&mut self) -> Result<()> {
-        self.sync(
-            &(self.cache_path.join("cache.dat")),
-            FAST_PARAMS.clone().unwrap(),
-        )?;
+        self.sync(&(self.cache_path.join("cache.dat")))?;
+        Ok(())
+    }
+
+    pub fn global_sync(&mut self) -> Result<()> {
+        self.remote_sync()?;
+        self.local_sync()?;
         Ok(())
     }
 }
@@ -824,8 +791,7 @@ impl Vault<LockedVault> {
         }
     }
 
-    pub async fn remote_unlock(self, master_key: &str) -> Result<Vault<UnlockedVault>> {
-        let session_key = SessionKey::new(master_key)?;
+    pub async fn remote_unlock(self, password: &str) -> Result<Vault<UnlockedVault>> {
         let client = reqwest::Client::builder().build()?;
         let blob_bytes = client
             .get(
@@ -839,15 +805,16 @@ impl Vault<LockedVault> {
             .bytes()
             .await?;
         let blob = from_bytes::<Blob>(&blob_bytes.slice(..))?;
+        let master_key = derive_key(password.as_bytes(), blob.salt)?;
 
-        let file_params = HashParam::with_nonce(
-            &session_key.get_key()?,
-            blob.salt,
-            blob.nonce,
-            SECURE_PARAMS.clone().unwrap(),
-        )?;
+        let file_params = HashParam {
+            key: master_key,
+            nonce: blob.nonce,
+        };
 
         let payload = blob.decrypt(&file_params)?;
+
+        cache_key(master_key, password.as_bytes())?;
 
         Ok(Vault {
             repo_name: self.repo_name,
@@ -855,25 +822,24 @@ impl Vault<LockedVault> {
             device_type: self.device_type,
             cache_path: self.cache_path,
             state: UnlockedVault {
-                session_key,
+                session_key: master_key,
                 payload,
             },
         })
     }
 
-    pub fn local_unlock(self, master_key: &str) -> Result<Vault<UnlockedVault>> {
-        let session_key = SessionKey::new(master_key)?;
+    pub fn local_unlock(self, password: &str) -> Result<Vault<UnlockedVault>> {
         let mut buf = Vec::new();
         let mut cache_file = File::open(self.cache_path.join("cache.dat"))?;
         cache_file.read_to_end(&mut buf)?;
 
         let blob = from_bytes::<Blob>(&buf)?;
-        let file_params = HashParam::with_nonce(
-            &session_key.get_key()?,
-            blob.salt,
-            blob.nonce,
-            FAST_PARAMS.clone().unwrap(),
-        )?;
+        let master_key = derive_key(password.as_bytes(), blob.salt)?;
+
+        let file_params = HashParam {
+            key: master_key,
+            nonce: blob.nonce,
+        };
 
         let payload = blob.decrypt(&file_params)?;
         Ok(Vault {
@@ -882,13 +848,79 @@ impl Vault<LockedVault> {
             device_type: self.device_type,
             cache_path: self.cache_path,
             state: UnlockedVault {
-                session_key,
+                session_key: master_key,
                 payload,
             },
         })
     }
 
-    pub fn init_repo(self, priv_key: &str, master_key: &str) -> Result<Vault<UnlockedVault>> {
+    pub async fn remote_unlock_cached(self, password: &str) -> Result<Vault<UnlockedVault>> {
+        let client = reqwest::Client::builder().build()?;
+        let blob_bytes = client
+            .get(
+                &("https://github.com/".to_string()
+                    + &self.repo_name
+                    + "/raw/refs/heads/main/vault.dat"),
+            )
+            .header("Cache-Control", "no-cache, no-store, must-revalidate")
+            .send()
+            .await?
+            .bytes()
+            .await?;
+        let blob = from_bytes::<Blob>(&blob_bytes.slice(..))?;
+        let master_key = retrive_key(password.as_bytes())?;
+
+        let file_params = HashParam {
+            key: master_key,
+            nonce: blob.nonce,
+        };
+
+        let payload = blob.decrypt(&file_params)?;
+
+        cache_key(master_key, password.as_bytes())?;
+
+        Ok(Vault {
+            repo_name: self.repo_name,
+            device_name: self.device_name,
+            device_type: self.device_type,
+            cache_path: self.cache_path,
+            state: UnlockedVault {
+                session_key: master_key,
+                payload,
+            },
+        })
+    }
+
+    pub fn local_unlock_cached(self, password: &str) -> Result<Vault<UnlockedVault>> {
+        let mut buf = Vec::new();
+        let mut cache_file = File::open(self.cache_path.join("cache.dat"))?;
+        cache_file.read_to_end(&mut buf)?;
+
+        let blob = from_bytes::<Blob>(&buf)?;
+        let master_key = retrive_key(password.as_bytes())?;
+
+        let file_params = HashParam {
+            key: master_key,
+            nonce: blob.nonce,
+        };
+
+        let payload = blob.decrypt(&file_params)?;
+
+        cache_key(master_key, password.as_bytes())?;
+
+        Ok(Vault {
+            repo_name: self.repo_name,
+            device_name: self.device_name,
+            device_type: self.device_type,
+            cache_path: self.cache_path,
+            state: UnlockedVault {
+                session_key: master_key,
+                payload,
+            },
+        })
+    }
+
+    pub fn init_repo(self, priv_key: &str, password: &str) -> Result<Vault<UnlockedVault>> {
         let repo_offset = "repo";
 
         let repo = clone_snapshot(
@@ -906,52 +938,48 @@ impl Vault<LockedVault> {
         );
 
         let mut salt = [0u8; 16];
+        let mut nonce = [0u8; 24];
         let mut rng = SysRng;
         rng.try_fill_bytes(&mut salt)?;
+        rng.try_fill_bytes(&mut nonce)?;
 
-        let remote_params =
-            HashParam::new(master_key.as_bytes(), salt, SECURE_PARAMS.clone().unwrap())?;
+        let master_key = derive_key(password.as_bytes(), salt)?;
 
-        let local_params =
-            HashParam::new(master_key.as_bytes(), salt, FAST_PARAMS.clone().unwrap())?;
-
-        let encrypted_payload = payload.encrypt(&remote_params)?;
-
-        let remote_blob = Blob {
-            salt: salt,
-            nonce: remote_params.nonce,
-            payload_store: encrypted_payload,
+        let params = HashParam {
+            key: master_key,
+            nonce,
         };
 
-        let encrypted_payload = payload.encrypt(&local_params)?;
+        let encrypted_payload = payload.encrypt(&params)?;
 
-        let local_blob = Blob {
+        let blob = Blob {
             salt: salt,
-            nonce: local_params.nonce,
+            nonce: params.nonce,
             payload_store: encrypted_payload,
         };
 
         fs::write(
             &(self.cache_path.join("cache.dat")),
-            to_stdvec(&local_blob)?.as_slice(),
+            to_stdvec(&blob)?.as_slice(),
         )?;
 
         fs::write(
             &(self.cache_path.join(&repo_offset).join("vault.dat")),
-            to_stdvec(&remote_blob)?.as_slice(),
+            to_stdvec(&blob)?.as_slice(),
         )?;
 
         add_and_commit(&repo, Path::new("vault.dat"), "Commit Message")?;
         ssh_push(&repo, priv_key)?;
 
-        let session_key = SessionKey::new(master_key)?;
+        cache_key(master_key, password.as_bytes())?;
+
         Ok(Vault {
             repo_name: self.repo_name,
             device_name: self.device_name,
             device_type: self.device_type,
             cache_path: self.cache_path,
             state: UnlockedVault {
-                session_key,
+                session_key: master_key,
                 payload,
             },
         })
