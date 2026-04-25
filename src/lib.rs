@@ -53,7 +53,7 @@ fn derive_key(password: &[u8], salt: [u8; 16]) -> Result<[u8; 32]> {
     Ok(key)
 }
 
-fn cache_key(key: [u8; 32], password: &[u8]) -> Result<()> {
+fn cache_key(key: [u8; 32], password: &[u8], repo_name: &str) -> Result<()> {
     let mut salt = [0u8; 16];
     let mut nonce = [0u8; 24];
     let mut rng = SysRng;
@@ -80,13 +80,13 @@ fn cache_key(key: [u8; 32], password: &[u8]) -> Result<()> {
         nonce,
     };
 
-    let entry = Entry::new("SecretInnKeep", "TauriUserKey")?;
+    let entry = Entry::new("SecretInnKeep", repo_name)?;
     entry.set_password(&STANDARD.encode(to_stdvec(&store)?.as_slice()))?;
     Ok(())
 }
 
-fn retrive_key(password: &[u8]) -> Result<[u8; 32]> {
-    let entry = Entry::new("SecretInnKeep", "TauriUserKey")?;
+fn retrive_key(password: &[u8], repo_name: &str) -> Result<[u8; 32]> {
+    let entry = Entry::new("SecretInnKeep", repo_name)?;
     let secret = entry.get_password()?;
 
     let store = from_bytes::<KeyStore>(STANDARD.decode(&secret)?.as_slice())?;
@@ -814,7 +814,7 @@ impl Vault<LockedVault> {
 
         let payload = blob.decrypt(&file_params)?;
 
-        cache_key(master_key, password.as_bytes())?;
+        cache_key(master_key, password.as_bytes(), &self.repo_name)?;
 
         Ok(Vault {
             repo_name: self.repo_name,
@@ -868,7 +868,7 @@ impl Vault<LockedVault> {
             .bytes()
             .await?;
         let blob = from_bytes::<Blob>(&blob_bytes.slice(..))?;
-        let master_key = retrive_key(password.as_bytes())?;
+        let master_key = retrive_key(password.as_bytes(), &self.repo_name)?;
 
         let file_params = HashParam {
             key: master_key,
@@ -877,7 +877,7 @@ impl Vault<LockedVault> {
 
         let payload = blob.decrypt(&file_params)?;
 
-        cache_key(master_key, password.as_bytes())?;
+        cache_key(master_key, password.as_bytes(), &self.repo_name)?;
 
         Ok(Vault {
             repo_name: self.repo_name,
@@ -897,7 +897,7 @@ impl Vault<LockedVault> {
         cache_file.read_to_end(&mut buf)?;
 
         let blob = from_bytes::<Blob>(&buf)?;
-        let master_key = retrive_key(password.as_bytes())?;
+        let master_key = retrive_key(password.as_bytes(), &self.repo_name)?;
 
         let file_params = HashParam {
             key: master_key,
@@ -906,7 +906,7 @@ impl Vault<LockedVault> {
 
         let payload = blob.decrypt(&file_params)?;
 
-        cache_key(master_key, password.as_bytes())?;
+        cache_key(master_key, password.as_bytes(), &self.repo_name)?;
 
         Ok(Vault {
             repo_name: self.repo_name,
@@ -971,7 +971,7 @@ impl Vault<LockedVault> {
         add_and_commit(&repo, Path::new("vault.dat"), "Commit Message")?;
         ssh_push(&repo, priv_key)?;
 
-        cache_key(master_key, password.as_bytes())?;
+        cache_key(master_key, password.as_bytes(), &self.repo_name)?;
 
         Ok(Vault {
             repo_name: self.repo_name,
