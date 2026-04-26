@@ -772,7 +772,6 @@ impl Vault<UnlockedVault> {
 
     pub async fn remote_sync(&mut self) -> Result<()> {
         let pull_body = self.pull().await?;
-        fs::write("response.txt", serde_json::to_string(&pull_body)?)?;
         let blob;
         if let Some(c) = pull_body.content {
             let c = c.replace('\n', "").replace('\r', "");
