@@ -13,15 +13,13 @@ use argon2;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, aead::Aead};
 use educe::Educe;
-use git2::{
-    Commit, Cred, FetchOptions, ObjectType, Oid, PushOptions, RemoteCallbacks, Repository,
-    Signature,
-};
-use keyring::Entry;
+
+use keyring::Entry as KeyringEntry;
 use postcard::{from_bytes, to_stdvec};
 use rand::{TryRng, prelude::*, rngs::SysRng};
+use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
-use time::UtcDateTime;
+use time::{Date, Duration, UtcDateTime};
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -32,6 +30,48 @@ static FAST_PARAMS: Result<argon2::Params, argon2::Error> = argon2::Params::new(
 
 static LOG_MAX_LEN: usize = 1024;
 static PRE_ALLOC_SECURE_BUF: bool = true;
+
+fn set_union<T, F>(mut a: &mut Drain<'_, T>, mut b: &mut Drain<'_, T>, cmp: F) -> Vec<T>
+where
+    F: Fn(&T, &T) -> Ordering,
+{
+    let mut merged = Vec::with_capacity(a.len() + b.len());
+    let mut curr_a = a.next();
+    let mut curr_b = b.next();
+    loop {
+        match (curr_a, curr_b) {
+            (Some(value_a), Some(value_b)) => match cmp(&value_a, &value_b) {
+                Ordering::Less => {
+                    merged.push(value_a);
+                    curr_a = a.next();
+                    curr_b = Some(value_b);
+                }
+                Ordering::Equal => {
+                    merged.push(value_a);
+                    curr_a = a.next();
+                    curr_b = b.next();
+                }
+                Ordering::Greater => {
+                    merged.push(value_b);
+                    curr_b = b.next();
+                    curr_a = Some(value_a);
+                }
+            },
+            (Some(value), None) => {
+                merged.push(value);
+                merged.extend(&mut a);
+                break;
+            }
+            (None, Some(value)) => {
+                merged.push(value);
+                merged.extend(&mut b);
+                break;
+            }
+            _ => break,
+        }
+    }
+    merged
+}
 
 #[derive(Deserialize, Serialize, ZeroizeOnDrop)]
 struct KeyStore {
@@ -80,13 +120,13 @@ fn cache_key(key: [u8; 32], password: &[u8], repo_name: &str) -> Result<()> {
         nonce,
     };
 
-    let entry = Entry::new("SecretInnKeep", repo_name)?;
+    let entry = KeyringEntry::new("SecretInnKeep", repo_name)?;
     entry.set_password(&STANDARD.encode(to_stdvec(&store)?.as_slice()))?;
     Ok(())
 }
 
 fn retrive_key(password: &[u8], repo_name: &str) -> Result<[u8; 32]> {
-    let entry = Entry::new("SecretInnKeep", repo_name)?;
+    let entry = KeyringEntry::new("SecretInnKeep", repo_name)?;
     let secret = entry.get_password()?;
 
     let store = from_bytes::<KeyStore>(STANDARD.decode(&secret)?.as_slice())?;
@@ -112,134 +152,87 @@ fn retrive_key(password: &[u8], repo_name: &str) -> Result<[u8; 32]> {
     Ok(key)
 }
 
-fn clone_snapshot(path: &Path, repo_name: &str, priv_key: &str) -> Result<Repository> {
-    clone_archive(path, repo_name, 1, priv_key)
+#[derive(ZeroizeOnDrop, Serialize, Deserialize, Debug)]
+struct Token {
+    token: String,
+    #[zeroize(skip)]
+    expiry_date: Date,
 }
 
-fn clone_archive(path: &Path, repo_name: &str, depth: i32, priv_key: &str) -> Result<Repository> {
-    if path.exists() {
-        fs::remove_dir_all(&path)?;
-    }
-    let mut callbacks = RemoteCallbacks::new();
-    callbacks.credentials(|_url, username_from_url, _allowed_types| {
-        Cred::ssh_key_from_memory(username_from_url.unwrap_or("git"), None, priv_key, None)
-    });
-
-    let mut fo = FetchOptions::new();
-    fo.remote_callbacks(callbacks);
-    fo.depth(depth);
-
-    let mut builder = git2::build::RepoBuilder::new();
-    builder.fetch_options(fo);
-
-    let repo = builder.clone(&("git@github.com:".to_string() + repo_name + ".git"), path)?;
-    Ok(repo)
+#[derive(Serialize, Deserialize)]
+struct PullBody {
+    #[serde(rename = "_links")]
+    links: PullBodyLinks,
+    content: Option<String>,
+    download_url: Option<String>,
+    encoding: Option<String>,
+    entries: Option<Vec<Entry>>,
+    git_url: Option<String>,
+    html_url: Option<String>,
+    name: String,
+    path: String,
+    sha: String,
+    size: i64,
+    #[serde(rename = "type")]
+    pull_body_type: String,
+    url: String,
 }
 
-fn find_last_commit(repo: &'_ Repository) -> Result<Commit<'_>, git2::Error> {
-    let obj = repo.head()?.resolve()?.peel(ObjectType::Commit)?;
-    obj.into_commit()
-        .map_err(|_| git2::Error::from_str("Couldn't find commit"))
+#[derive(Serialize, Deserialize)]
+struct Entry {
+    #[serde(rename = "_links")]
+    links: EntryLinks,
+    download_url: Option<String>,
+    git_url: Option<String>,
+    html_url: Option<String>,
+    name: String,
+    path: String,
+    sha: String,
+    size: i64,
+    #[serde(rename = "type")]
+    entry_type: String,
+    url: String,
 }
 
-fn add_and_commit(repo: &Repository, path: &Path, message: &str) -> Result<Oid, git2::Error> {
-    let mut index = repo.index()?;
-    index.add_path(path)?;
-    let oid = index.write_tree()?;
-    let signature = Signature::now("Password Manager", "pmapp@gmail.com")?;
-    let parent_commit = find_last_commit(&repo);
-    let tree = repo.find_tree(oid)?;
-
-    match parent_commit {
-        Ok(c) => {
-            repo.commit(
-                Some("HEAD"), //  point HEAD to our new commit
-                &signature,   // author
-                &signature,   // committer
-                message,      // commit message
-                &tree,        // tree
-                &[&c],        // parents
-            )
-        }
-        Err(_) => {
-            repo.commit(
-                Some("HEAD"), //  point HEAD to our new commit
-                &signature,   // author
-                &signature,   // committer
-                message,      // commit message
-                &tree,        // tree
-                &[],          // parents
-            )
-        }
-    }
+#[derive(Serialize, Deserialize)]
+struct EntryLinks {
+    git: Option<String>,
+    html: Option<String>,
+    #[serde(rename = "self")]
+    links_self: String,
 }
 
-fn ssh_push(repo: &Repository, priv_key: &str) -> Result<()> {
-    let mut callbacks = RemoteCallbacks::new();
-    callbacks.credentials(|_url, username_from_url, _allowed_types| {
-        Cred::ssh_key_from_memory(username_from_url.unwrap_or("git"), None, priv_key, None)
-    });
-
-    let mut po = PushOptions::new();
-    po.remote_callbacks(callbacks);
-
-    repo.find_branch("main", git2::BranchType::Local)
-        .inspect_err(|_| {
-            let commit = find_last_commit(&repo).unwrap();
-            repo.branch("main", &commit, false).unwrap();
-        })?;
-
-    let mut callbacks = RemoteCallbacks::new();
-    callbacks.credentials(|_url, username_from_url, _allowed_types| {
-        Cred::ssh_key_from_memory(username_from_url.unwrap_or("git"), None, priv_key, None)
-    });
-
-    let mut remote = repo.find_remote("origin")?;
-    remote.connect_auth(git2::Direction::Push, Some(callbacks), None)?;
-    remote.push(&["refs/heads/main:refs/heads/main"], Some(&mut po))?;
-    Ok(())
+#[derive(Serialize, Deserialize)]
+struct PullBodyLinks {
+    git: Option<String>,
+    html: Option<String>,
+    #[serde(rename = "self")]
+    links_self: String,
 }
 
-fn set_union<T, F>(mut a: &mut Drain<'_, T>, mut b: &mut Drain<'_, T>, cmp: F) -> Vec<T>
-where
-    F: Fn(&T, &T) -> Ordering,
-{
-    let mut merged = Vec::with_capacity(a.len() + b.len());
-    let mut curr_a = a.next();
-    let mut curr_b = b.next();
-    loop {
-        match (curr_a, curr_b) {
-            (Some(value_a), Some(value_b)) => match cmp(&value_a, &value_b) {
-                Ordering::Less => {
-                    merged.push(value_a);
-                    curr_a = a.next();
-                    curr_b = Some(value_b);
-                }
-                Ordering::Equal => {
-                    merged.push(value_a);
-                    curr_a = a.next();
-                    curr_b = b.next();
-                }
-                Ordering::Greater => {
-                    merged.push(value_b);
-                    curr_b = b.next();
-                    curr_a = Some(value_a);
-                }
-            },
-            (Some(value), None) => {
-                merged.push(value);
-                merged.extend(&mut a);
-                break;
-            }
-            (None, Some(value)) => {
-                merged.push(value);
-                merged.extend(&mut b);
-                break;
-            }
-            _ => break,
+#[derive(Serialize, Deserialize)]
+struct PushBody {
+    message: String,
+    content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha: Option<String>,
+    committer: Committer,
+    branch: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Committer {
+    name: String,
+    email: String,
+}
+
+impl Committer {
+    fn new(name: &str, email: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            email: email.to_string(),
         }
     }
-    merged
 }
 
 #[derive(ZeroizeOnDrop)]
@@ -457,7 +450,7 @@ impl<'a> PasswordView<'a> {
 #[derive(ZeroizeOnDrop, Serialize, Deserialize, Educe)]
 #[educe(Debug)]
 struct Payload {
-    priv_key: String,
+    token: Token,
     log_history: SecureRingBuf<MetaData>,
     passwords: Vec<PasswordEntry>,
     #[serde(skip_deserializing)]
@@ -468,7 +461,8 @@ struct Payload {
 impl Payload {
     fn size(&self) -> usize {
         // not counting the padding
-        self.priv_key.len()
+        self.token.token.len()
+            + 4
             + self.passwords.len() * size_of::<PasswordEntry>()
             + self
                 .passwords
@@ -500,9 +494,21 @@ impl Payload {
         Ok(cipher.encrypt(&params.nonce.into(), payload_bytes.as_slice())?)
     }
 
-    pub fn new(priv_key: &str) -> Result<Self> {
+    pub fn new(pat: &str, exp_date: i32) -> Result<Self> {
+        let token = Token {
+            token: pat.to_string(),
+            expiry_date: if exp_date == 0 {
+                Date::MAX
+            } else {
+                UtcDateTime::now()
+                    .date()
+                    .checked_add(Duration::days(exp_date as i64))
+                    .unwrap()
+            },
+        };
+
         Ok(Self {
-            priv_key: priv_key.to_string(),
+            token,
             log_history: SecureRingBuf::new(LOG_MAX_LEN),
             passwords: vec![],
             padding: vec![],
@@ -523,23 +529,22 @@ impl Payload {
             a.time_stamp.cmp(&b.time_stamp)
         });
 
-        // since we are using v7 uuids we can use sorted vector set union algorithm
-
         let mut merged: HashMap<Uuid, PasswordEntry> =
             self.passwords.drain(..).map(|p| (p.uuid, p)).collect();
 
-        for pwd in other.passwords.drain(..){
+        for pwd in other.passwords.drain(..) {
             let edit_time = pwd.last_edit;
-            match merged.insert(pwd.uuid, pwd){
+            match merged.insert(pwd.uuid, pwd) {
                 Some(cur) => {
                     if edit_time < cur.last_edit {
                         merged.insert(cur.uuid, cur);
-                    } 
+                    }
                 }
                 None => {}
             }
         }
-        
+
+        self.passwords = merged.into_values().collect();
     }
 }
 
@@ -699,16 +704,37 @@ impl Vault<UnlockedVault> {
         }
     }
 
-    fn sync(&mut self, file_path: &Path) -> Result<()> {
-        if !file_path.is_file() {
-            return Err(Error::msg(format!(
-                "Vault file doesn't exist {:?}",
-                file_path
-            )));
-        }
+    async fn pull(&self) -> Result<PullBody> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            ACCEPT,
+            HeaderValue::from_str("application/vnd.github+json")?,
+        );
+        let mut token_header =
+            HeaderValue::from_str(&(format!("Bearer {}", &self.state.payload.token.token)))?;
+        token_header.set_sensitive(true);
+        headers.insert(AUTHORIZATION, token_header);
+        headers.insert("X-GitHub-Api-Version", HeaderValue::from_str("2026-03-10")?);
+        headers.insert("User-Agent", HeaderValue::from_str("Password Manager App")?);
 
-        let blob = Blob::from_file(file_path)?;
+        let client = reqwest::Client::builder().build()?;
+        let body_str = client
+            .get(
+                &(format!(
+                    "https://api.github.com/repos/{}/contents/vault.dat",
+                    &self.repo_name
+                )),
+            )
+            .headers(headers)
+            .send()
+            .await?
+            .text()
+            .await?;
 
+        Ok(serde_json::from_str::<PullBody>(&body_str)?)
+    }
+
+    fn sync(&mut self, blob: Blob) -> Result<Vec<u8>> {
         let file_params = HashParam {
             key: self.state.session_key,
             nonce: blob.nonce,
@@ -741,38 +767,53 @@ impl Vault<UnlockedVault> {
             payload_store: encrypted_payload,
         };
 
-        let serialized_blob = to_stdvec(&updated_blob)?;
-
-        fs::write(file_path, serialized_blob.as_slice())?;
-        Ok(())
+        Ok(to_stdvec(&updated_blob)?)
     }
 
-    pub fn remote_sync(&mut self) -> Result<()> {
-        let repo_offset = "repo";
+    pub async fn remote_sync(&mut self) -> Result<()> {
+        let pull_body = self.pull().await?;
+        fs::write("response.txt", serde_json::to_string(&pull_body)?)?;
+        let blob;
+        if let Some(c) = pull_body.content {
+            let c = c.replace('\n', "").replace('\r', "");
+            blob = from_bytes::<Blob>(&STANDARD.decode(&c)?)?
+        } else {
+            return Err(Error::msg("Empty response"));
+        }
+        let sha = pull_body.sha;
+        let serialized_blob = self.sync(blob)?;
 
-        let repo = clone_snapshot(
-            &(self.cache_path.join(repo_offset)),
-            &self.repo_name,
-            &self.state.get_payload().priv_key,
-        )?;
-
-        self.sync(&(self.cache_path.join(repo_offset).join("vault.dat")))?;
-
-        add_and_commit(&repo, Path::new("vault.dat"), "Commit Message")?;
-        ssh_push(&repo, &self.state.get_payload().priv_key)?;
+        self.push(
+            serialized_blob.as_slice(),
+            Some(&sha),
+            &self.state.payload.token.token,
+        )
+        .await?;
         Ok(())
     }
 
     pub fn local_sync(&mut self) -> Result<()> {
-        self.sync(&(self.cache_path.join("cache.dat")))?;
+        let file_path = &(self.cache_path.join("cache.dat"));
+        if !file_path.is_file() {
+            return Err(Error::msg(format!(
+                "Vault file doesn't exist {:?}",
+                file_path
+            )));
+        }
+        let blob = Blob::from_file(file_path)?;
+
+        let serialized_blob = self.sync(blob)?;
+        fs::write(file_path, serialized_blob.as_slice())?;
         Ok(())
     }
 
-    pub fn global_sync(&mut self) -> Result<()> {
-        self.remote_sync()?;
+    pub async fn global_sync(&mut self) -> Result<()> {
+        self.remote_sync().await?;
         self.local_sync()?;
         Ok(())
     }
+
+    // TODO add write to disk ????
 }
 
 impl Vault<LockedVault> {
@@ -792,19 +833,7 @@ impl Vault<LockedVault> {
     }
 
     pub async fn remote_unlock(self, password: &str) -> Result<Vault<UnlockedVault>> {
-        let client = reqwest::Client::builder().build()?;
-        let blob_bytes = client
-            .get(
-                &("https://github.com/".to_string()
-                    + &self.repo_name
-                    + "/raw/refs/heads/main/vault.dat"),
-            )
-            .header("Cache-Control", "no-cache, no-store, must-revalidate")
-            .send()
-            .await?
-            .bytes()
-            .await?;
-        let blob = from_bytes::<Blob>(&blob_bytes.slice(..))?;
+        let blob = self.fetch().await?;
         let master_key = derive_key(password.as_bytes(), blob.salt)?;
 
         let file_params = HashParam {
@@ -920,16 +949,13 @@ impl Vault<LockedVault> {
         })
     }
 
-    pub fn init_repo(self, priv_key: &str, password: &str) -> Result<Vault<UnlockedVault>> {
-        let repo_offset = "repo";
-
-        let repo = clone_snapshot(
-            &(self.cache_path.join(repo_offset)),
-            &self.repo_name,
-            priv_key,
-        )?;
-
-        let mut payload = Payload::new(priv_key)?;
+    pub async fn init_repo(
+        self,
+        pat: &str,
+        exp_date: i32,
+        password: &str,
+    ) -> Result<Vault<UnlockedVault>> {
+        let mut payload = Payload::new(pat, exp_date)?;
 
         payload.log(
             &self.repo_name,
@@ -950,6 +976,7 @@ impl Vault<LockedVault> {
             nonce,
         };
 
+        payload.pad();
         let encrypted_payload = payload.encrypt(&params)?;
 
         let blob = Blob {
@@ -958,18 +985,14 @@ impl Vault<LockedVault> {
             payload_store: encrypted_payload,
         };
 
+        let serialized_blob = to_stdvec(&blob)?;
+
         fs::write(
             &(self.cache_path.join("cache.dat")),
-            to_stdvec(&blob)?.as_slice(),
+            serialized_blob.as_slice(),
         )?;
 
-        fs::write(
-            &(self.cache_path.join(&repo_offset).join("vault.dat")),
-            to_stdvec(&blob)?.as_slice(),
-        )?;
-
-        add_and_commit(&repo, Path::new("vault.dat"), "Commit Message")?;
-        ssh_push(&repo, priv_key)?;
+        self.push(serialized_blob.as_slice(), None, pat).await?;
 
         cache_key(master_key, password.as_bytes(), &self.repo_name)?;
 
@@ -983,5 +1006,63 @@ impl Vault<LockedVault> {
                 payload,
             },
         })
+    }
+}
+
+impl<V> Vault<V>
+where
+    V: ZeroizeOnDrop + VaultMarker,
+{
+    async fn fetch(&self) -> Result<Blob> {
+        let client = reqwest::Client::builder().build()?;
+        let blob_bytes = client
+            .get(
+                &("https://github.com/".to_string()
+                    + &self.repo_name
+                    + "/raw/refs/heads/main/vault.dat"),
+            )
+            .header("Cache-Control", "no-cache, no-store, must-revalidate")
+            .send()
+            .await?
+            .bytes()
+            .await?;
+        let blob = from_bytes::<Blob>(&blob_bytes.slice(..))?;
+        Ok(blob)
+    }
+
+    async fn push(&self, data: &[u8], sha: Option<&str>, token: &str) -> Result<()> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            ACCEPT,
+            HeaderValue::from_str("application/vnd.github+json")?,
+        );
+        let mut token_header = HeaderValue::from_str(&(format!("Bearer {}", token)))?;
+        token_header.set_sensitive(true);
+        headers.insert(AUTHORIZATION, token_header);
+        headers.insert("X-GitHub-Api-Version", HeaderValue::from_str("2026-03-10")?);
+        headers.insert("User-Agent", HeaderValue::from_str("Password Manager App")?);
+
+        let client = reqwest::Client::builder().build()?;
+
+        let body = PushBody {
+            message: "Commit Message".to_string(),
+            content: STANDARD.encode(data),
+            sha: sha.map(|s| s.to_string()),
+            committer: Committer::new("Password Manager App", "pmapp@gmail.com"),
+            branch: "main".to_string(),
+        };
+
+        client
+            .put(
+                &(format!(
+                    "https://api.github.com/repos/{}/contents/vault.dat",
+                    &self.repo_name
+                )),
+            )
+            .headers(headers)
+            .body(serde_json::to_string(&body)?)
+            .send()
+            .await?;
+        Ok(())
     }
 }

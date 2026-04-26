@@ -4,8 +4,7 @@ use std::{
 };
 
 use anyhow::Result;
-use pm_core::{UnlockedVault, Vault, LockedVault};
-use ssh_key::{PrivateKey, rand_core::OsRng};
+use pm_core::{LockedVault, UnlockedVault, Vault};
 use uuid::Uuid;
 
 fn action(vault: &mut Vault<UnlockedVault>) -> Result<()> {
@@ -59,13 +58,15 @@ async fn main() -> Result<()> {
     stdin().read_line(&mut user_state)?;
 
     if user_state.trim() == "Init" {
+        let mut pat = String::new();
+        println!("Enter the personal access token: ");
+        stdin().read_line(&mut pat)?;
+        println!("Enter token duration to expire: ");
+        let mut expiration_date = String::new();
+        stdin().read_line(&mut expiration_date)?;
+        let expiration_date: i32 = expiration_date.trim().parse().unwrap();
+
         let mut master_key = String::new();
-        let mut rng = OsRng;
-        let priv_key = PrivateKey::random(&mut rng, ssh_key::Algorithm::Ed25519)?;
-        println!(
-            "Add this public key to your deploy keys. \n {}",
-            priv_key.public_key().to_openssh()?
-        );
         println!("Enter a new master password: (should be very strong)");
         stdin().read_line(&mut master_key)?;
         let vault = Vault::empty(
@@ -74,10 +75,10 @@ async fn main() -> Result<()> {
             Some("Linux laptop"),
             &cache_path,
         );
-        vault.init_repo(
-            &priv_key.to_openssh(ssh_key::LineEnding::LF)?,
-            master_key.trim()
-        )?;
+        vault
+            .init_repo(pat.trim(), expiration_date, master_key.trim())
+            .await?;
+        
     } else if user_state.trim() == "Fetch" {
         println!("Enter the master password: (must be the same one the repo uses)");
         let mut master_key = String::new();
@@ -91,7 +92,7 @@ async fn main() -> Result<()> {
         let mut vault = vault.remote_unlock_cached(master_key.trim()).await?;
         vault.local_sync()?;
         action(&mut vault)?;
-        vault.global_sync()?;
+        vault.global_sync().await?;
     } else if user_state.trim() == "Read" {
         println!("Enter the master password: (must be the same one the repo uses)");
         let mut master_key = String::new();
