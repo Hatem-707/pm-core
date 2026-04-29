@@ -12,12 +12,11 @@ use anyhow::{Error, Result};
 use argon2;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, aead::Aead};
-use educe::Educe;
 
 use keyring::Entry as KeyringEntry;
 use postcard::{from_bytes, to_stdvec};
-use rand::{TryRng, prelude::*, rngs::SysRng};
-use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
+use rand::{RngExt, TryRng, rngs::SysRng};
+use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use time::{Date, Duration, UtcDateTime};
 use uuid::Uuid;
@@ -125,7 +124,7 @@ fn cache_key(key: [u8; 32], password: &[u8], repo_name: &str) -> Result<()> {
     Ok(())
 }
 
-fn retrive_key(password: &[u8], repo_name: &str) -> Result<[u8; 32]> {
+fn retrieve_key(password: &[u8], repo_name: &str) -> Result<[u8; 32]> {
     let entry = KeyringEntry::new("SecretInnKeep", repo_name)?;
     let secret = entry.get_password()?;
 
@@ -447,48 +446,19 @@ impl<'a> PasswordView<'a> {
     }
 }
 
-#[derive(ZeroizeOnDrop, Serialize, Deserialize, Educe)]
-#[educe(Debug)]
+#[derive(ZeroizeOnDrop, Serialize, Deserialize, Debug)]
 struct Payload {
     token: Token,
     log_history: SecureRingBuf<MetaData>,
     passwords: Vec<PasswordEntry>,
-    #[serde(skip_deserializing)]
-    #[educe(Debug(ignore))]
-    padding: Vec<u8>,
 }
 
 impl Payload {
-    fn size(&self) -> usize {
-        // not counting the padding
-        self.token.token.len()
-            + 4
-            + self.passwords.len() * size_of::<PasswordEntry>()
-            + self
-                .passwords
-                .iter()
-                .map(|a| {
-                    a.name.len()
-                        + a.url.as_ref().map_or(0, |s| s.len())
-                        + a.username.as_ref().map_or(0, |s| s.len())
-                        + a.note.as_ref().map_or(0, |s| s.len())
-                        + a.password.len()
-                })
-                .sum::<usize>()
-            + size_of::<SecureRingBuf<MetaData>>()
-            + self.log_history.buf.len() * size_of::<MetaData>()
-    }
-
-    pub fn pad(&mut self) {
-        let curr_size = self.size();
-        let pad_size = (1 << 20) - curr_size % (1 << 20); // not serilized size but close enough 
-        let mut rng = rand::rng();
-        self.padding.resize(pad_size, 0);
-        rng.fill(self.padding.as_mut_slice());
-    }
-
     pub fn encrypt(&self, params: &HashParam) -> Result<Vec<u8>> {
-        let payload_bytes = Zeroizing::new(to_stdvec(&self)?); // TODO change this as it might leak data
+        let mut payload_bytes = Zeroizing::new(to_stdvec(&self)?); // TODO change this as it might leak data
+        let padded_size = payload_bytes.len() + (1<<18) - payload_bytes.len() % (1<<8);
+        let mut rng = rand::rng();
+        payload_bytes.resize_with( padded_size, || rng.random());
 
         let cipher = XChaCha20Poly1305::new(&params.key.into());
         Ok(cipher.encrypt(&params.nonce.into(), payload_bytes.as_slice())?)
@@ -511,7 +481,6 @@ impl Payload {
             token,
             log_history: SecureRingBuf::new(LOG_MAX_LEN),
             passwords: vec![],
-            padding: vec![],
         })
     }
 
@@ -757,8 +726,6 @@ impl Vault<UnlockedVault> {
             key: self.state.session_key,
             nonce: nonce,
         };
-
-        self.state.get_payload_mut().pad();
         let encrypted_payload = self.state.get_payload().encrypt(&updated_params)?;
 
         let updated_blob = Blob {
@@ -896,7 +863,7 @@ impl Vault<LockedVault> {
             .bytes()
             .await?;
         let blob = from_bytes::<Blob>(&blob_bytes.slice(..))?;
-        let master_key = retrive_key(password.as_bytes(), &self.repo_name)?;
+        let master_key = retrieve_key(password.as_bytes(), &self.repo_name)?;
 
         let file_params = HashParam {
             key: master_key,
@@ -925,7 +892,7 @@ impl Vault<LockedVault> {
         cache_file.read_to_end(&mut buf)?;
 
         let blob = from_bytes::<Blob>(&buf)?;
-        let master_key = retrive_key(password.as_bytes(), &self.repo_name)?;
+        let master_key = retrieve_key(password.as_bytes(), &self.repo_name)?;
 
         let file_params = HashParam {
             key: master_key,
@@ -975,7 +942,6 @@ impl Vault<LockedVault> {
             nonce,
         };
 
-        payload.pad();
         let encrypted_payload = payload.encrypt(&params)?;
 
         let blob = Blob {
@@ -1051,7 +1017,7 @@ where
             branch: "main".to_string(),
         };
 
-        client
+        let res = client
             .put(
                 &(format!(
                     "https://api.github.com/repos/{}/contents/vault.dat",
@@ -1062,6 +1028,7 @@ where
             .body(serde_json::to_string(&body)?)
             .send()
             .await?;
+        println!("{:?}", res.status());
         Ok(())
     }
 }

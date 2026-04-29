@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::Result;
-use pm_core::{LockedVault, UnlockedVault, Vault};
+use pm_core::{ UnlockedVault, Vault};
 use uuid::Uuid;
 
 fn action(vault: &mut Vault<UnlockedVault>) -> Result<()> {
