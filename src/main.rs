@@ -3,8 +3,7 @@ use std::{
     path::Path,
 };
 
-use anyhow::Result;
-use pm_core::{ UnlockedVault, Vault};
+use pm_core::{ UnlockedVault, Vault, Result};
 use uuid::Uuid;
 
 fn action(vault: &mut Vault<UnlockedVault>) -> Result<()> {

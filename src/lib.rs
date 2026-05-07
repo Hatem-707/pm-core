@@ -8,7 +8,6 @@ use std::{
     vec::Drain,
 };
 
-use anyhow::{Error, Result};
 use argon2;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, aead::Aead};
@@ -22,10 +21,12 @@ use time::{Date, Duration, UtcDateTime};
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-static SECURE_PARAMS: Result<argon2::Params, argon2::Error> =
-    argon2::Params::new(262_144, 4, 4, None); // 256 MB main encryption
+mod error;
+pub use error::{Error, Result};
 
-static FAST_PARAMS: Result<argon2::Params, argon2::Error> = argon2::Params::new(32_768, 3, 4, None); // stores the encrypted key in os storage
+static SECURE_PARAMS: argon2::Result<argon2::Params> = argon2::Params::new(262_144, 4, 4, None); // 256 MB main encryption
+
+static FAST_PARAMS: argon2::Result<argon2::Params> = argon2::Params::new(32_768, 3, 4, None); // stores the encrypted key in os storage
 
 static LOG_MAX_LEN: usize = 1024;
 static PRE_ALLOC_SECURE_BUF: bool = true;
@@ -88,7 +89,7 @@ fn derive_key(password: &[u8], salt: [u8; 16]) -> Result<[u8; 32]> {
     let mut key = [0; 32];
     argon2
         .hash_password_into(password, &salt, key.as_mut_slice())
-        .map_err(|_| Error::msg("Couldn't generate hashing parameters"))?;
+        .map_err(|_| "Couldn't generate hashing parameters")?;
     Ok(key)
 }
 
@@ -107,7 +108,7 @@ fn cache_key(key: [u8; 32], password: &[u8], repo_name: &str) -> Result<()> {
     let mut output = [0; 32];
     argon2
         .hash_password_into(password, &salt, &mut output)
-        .map_err(|_| Error::msg("Couldn't generate hashing parameters"))?;
+        .map_err(|_| "Couldn't generate hashing parameters")?;
 
     let cipher = XChaCha20Poly1305::new(&output.into());
 
@@ -139,7 +140,7 @@ fn retrieve_key(password: &[u8], repo_name: &str) -> Result<[u8; 32]> {
     let mut output = [0; 32];
     argon2
         .hash_password_into(password, &store.salt, &mut output)
-        .map_err(|_| Error::msg("Couldn't generate hashing parameters"))?;
+        .map_err(|_| "Couldn't generate hashing parameters")?;
 
     let cipher = XChaCha20Poly1305::new(&output.into());
 
@@ -456,9 +457,9 @@ struct Payload {
 impl Payload {
     pub fn encrypt(&self, params: &HashParam) -> Result<Vec<u8>> {
         let mut payload_bytes = Zeroizing::new(to_stdvec(&self)?); // TODO change this as it might leak data
-        let padded_size = payload_bytes.len() + (1<<18) - payload_bytes.len() % (1<<8);
+        let padded_size = payload_bytes.len() + (1 << 18) - payload_bytes.len() % (1 << 8);
         let mut rng = rand::rng();
-        payload_bytes.resize_with( padded_size, || rng.random());
+        payload_bytes.resize_with(padded_size, || rng.random());
 
         let cipher = XChaCha20Poly1305::new(&params.key.into());
         Ok(cipher.encrypt(&params.nonce.into(), payload_bytes.as_slice())?)
@@ -530,16 +531,14 @@ impl Blob {
         let mut reader = BufReader::new(file);
         let mut bytes = Vec::<u8>::new();
         reader.read_to_end(&mut bytes)?;
-        from_bytes::<Blob>(&bytes).map_err(|_| Error::msg("Error reading Blob from file"))
+        Ok(from_bytes::<Blob>(&bytes)?)
     }
 
     pub fn decrypt(&self, params: &HashParam) -> Result<Payload> {
         let cipher = XChaCha20Poly1305::new(&params.key.into());
         let payload_bytes =
             Zeroizing::new(cipher.decrypt(&params.nonce.into(), self.payload_store.as_slice())?);
-        let payload = from_bytes::<Payload>(payload_bytes.as_slice())
-            .map_err(|_| Error::msg("Couldn't Desrialize decrypted Metadata"))?;
-        Ok(payload)
+        Ok(from_bytes::<Payload>(payload_bytes.as_slice())?)
     }
 }
 
@@ -619,20 +618,17 @@ impl Vault<UnlockedVault> {
             .state
             .get_payload()
             .passwords
-            .binary_search_by_key(&uuid, |p| p.uuid);
-        match res {
-            Ok(i) => {
-                self.state.get_payload_mut().passwords[i].edit(
-                    name.as_deref().map(|s| s.to_string()),
-                    url.as_deref().map(|s| s.to_string()),
-                    username.as_deref().map(|s| s.to_string()),
-                    password.as_deref().map(|s| s.to_string()),
-                    note.as_deref().map(|s| s.to_string()),
-                );
-                Ok(())
-            }
-            Err(_) => Err(Error::msg("No matching password")),
-        }
+            .binary_search_by_key(&uuid, |p| p.uuid)
+            .map_err(|_| "No Password Found")?;
+
+        self.state.get_payload_mut().passwords[res].edit(
+            name.as_deref().map(|s| s.to_string()),
+            url.as_deref().map(|s| s.to_string()),
+            username.as_deref().map(|s| s.to_string()),
+            password.as_deref().map(|s| s.to_string()),
+            note.as_deref().map(|s| s.to_string()),
+        );
+        Ok(())
     }
 
     pub fn get_entry(&self, uuid: Uuid) -> Result<&PasswordEntry> {
@@ -640,11 +636,9 @@ impl Vault<UnlockedVault> {
             .state
             .get_payload()
             .passwords
-            .binary_search_by_key(&uuid, |p| p.uuid);
-        match res {
-            Ok(i) => Ok(&self.state.get_payload().passwords[i]),
-            Err(_) => Err(Error::msg("No matching password")),
-        }
+            .binary_search_by_key(&uuid, |p| p.uuid)
+            .map_err(|_| "No Password Found")?;
+        Ok(&self.state.get_payload().passwords[res])
     }
 
     pub fn get_logs(&self) -> impl Iterator<Item = &MetaData> {
@@ -744,7 +738,7 @@ impl Vault<UnlockedVault> {
             let c = c.replace('\n', "").replace('\r', "");
             blob = from_bytes::<Blob>(&STANDARD.decode(&c)?)?
         } else {
-            return Err(Error::msg("Empty response"));
+            return Err("Empty response".into());
         }
         let sha = pull_body.sha;
         let serialized_blob = self.sync(blob)?;
@@ -761,10 +755,7 @@ impl Vault<UnlockedVault> {
     pub fn local_sync(&mut self) -> Result<()> {
         let file_path = &(self.cache_path.join("cache.dat"));
         if !file_path.is_file() {
-            return Err(Error::msg(format!(
-                "Vault file doesn't exist {:?}",
-                file_path
-            )));
+            return Err(format!("Vault file doesn't exist {:?}", file_path).into());
         }
         let blob = Blob::from_file(file_path)?;
 
